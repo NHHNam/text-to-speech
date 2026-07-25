@@ -1,0 +1,8 @@
+# GUI framework
+PyQt6>=6.6.0
+
+# Offline Vietnamese text-to-speech engine (ONNX backend)
+vieneu
+
+# Build / packaging (optional, only needed to produce the standalone .exe)
+pyinstaller>=6.0.0
