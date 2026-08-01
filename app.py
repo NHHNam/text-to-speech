@@ -1,11 +1,12 @@
 import sys
 import os
-import multiprocessing
+import tempfile
 import subprocess
 from pathlib import Path
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtQml import QQmlApplicationEngine
 from PyQt6.QtCore import QObject, pyqtSlot, pyqtProperty, pyqtSignal, QThread
+import ast
 
 if getattr(sys, 'frozen', False):
     # Running in a PyInstaller bundle
@@ -17,44 +18,65 @@ else:
 # Fix for missing QtQuick Controls Windows style plugin on PyQt6
 os.environ["QT_QUICK_CONTROLS_STYLE"] = "Basic"
 
-# Ensure model is strictly loaded offline from hf_cache
-os.environ.setdefault("HF_HOME", str(BASE_DIR / "hf_cache"))
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-
-
-class ResultWatcher(QThread):
+class TTSWorker(QThread):
     """
-    Watches the result_queue in a background thread and emits a signal
-    back to the main Qt thread when a result arrives.
+    Runs TTS inference in a completely separate Python subprocess.
+    When the subprocess exits, the OS reclaims ALL memory including
+    ONNX Runtime internal pools — the only reliable way to prevent leaks.
     """
-    finished = pyqtSignal(bool, str)
-
-    def __init__(self, result_queue):
-        super().__init__()
-        self.result_queue = result_queue
-        self._running = True
-
+    resultReady = pyqtSignal(bool, str)
+    
+    def __init__(self, text, filepath, voice, style, parent=None):
+        super().__init__(parent)
+        self.text = text
+        self.filepath = filepath
+        self.voice = voice
+        
+        # Map QML style selections back to API keys
+        style_map = {
+            "tự nhiên": "tu_nhien",
+            "kể chuyện": "ke_chuyen",
+            "tin tức": "tin_tuc"
+        }
+        self.style = style_map.get(style, style)
+        
     def run(self):
-        while self._running:
+        # Write text to a temp file to avoid Windows command-line length limits
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".txt", delete=False
+        )
+        try:
+            tmp.write(self.text)
+            tmp.close()
+
+            # Locate the worker script next to app.py or inside the bundle
+            if getattr(sys, 'frozen', False):
+                worker_script = Path(sys._MEIPASS) / "tts_process.py"
+            else:
+                worker_script = BASE_DIR / "tts_process.py"
+
+            result = subprocess.run(
+                [sys.executable, str(worker_script),
+                 tmp.name, self.voice, self.style, self.filepath],
+                capture_output=True,
+                text=True,
+                encoding="utf-8"
+            )
+
+            stdout = result.stdout.strip()
+            if result.returncode == 0 and stdout == "OK":
+                self.resultReady.emit(True, f"Successfully saved to {self.filepath}")
+            else:
+                error = result.stderr.strip() or stdout
+                self.resultReady.emit(False, error)
+        except Exception as e:
+            self.resultReady.emit(False, str(e))
+        finally:
+            # Always clean up the temp text file
             try:
-                # Block with a timeout so we can check _running periodically
-                result = self.result_queue.get(timeout=0.5)
-                if result is None:
-                    break
-                status, payload = result
-                if status == "ok":
-                    self.finished.emit(True, f"Successfully saved to {payload}")
-                elif status == "error":
-                    self.finished.emit(False, payload)
-                # "ready" is handled by Backend.on_worker_ready — skip here
+                os.unlink(tmp.name)
             except Exception:
-                # Queue.get timeout — loop again
-                continue
-
-    def stop(self):
-        self._running = False
-
+                pass
 
 class Backend(QObject):
     statusChanged = pyqtSignal()
@@ -70,78 +92,30 @@ class Backend(QObject):
         self._isModelLoaded = False
         self._voiceLabels = []
         self._voiceVids = []
+        self.model = None
+        self.worker = None
+        
+    def load_model(self):
+        self.set_statusText("Loading model...")
+        try:
+            if getattr(sys, 'frozen', False):
+                voices_script = Path(sys._MEIPASS) / "voices_output.txt"
+            else:
+                voices_script = BASE_DIR / "voices_output.txt"
 
-        # Multiprocessing queues for IPC with the worker process
-        self._request_queue = multiprocessing.Queue()
-        self._result_queue  = multiprocessing.Queue()
-        self._worker_process = None
-        self._watcher = None
-
-    def start_worker(self):
-        """
-        Spawns the persistent worker process and waits for it to signal ready.
-        Also starts the ResultWatcher thread to relay results back to QML.
-        """
-        self.set_statusText("Loading model (first launch may take a moment)...")
-
-        from tts_process import worker_main
-        self._worker_process = multiprocessing.Process(
-            target=worker_main,
-            args=(self._request_queue, self._result_queue, str(BASE_DIR)),
-            daemon=True
-        )
-
-        # On Windows, temporarily patch subprocess.Popen so that
-        # multiprocessing (which uses it internally) spawns with no console window.
-        if sys.platform == "win32":
-            _orig = subprocess.Popen.__init__
-            def _no_window_popen(self_inner, *args, **kwargs):
-                kwargs.setdefault("creationflags", 0)
-                kwargs["creationflags"] |= subprocess.CREATE_NO_WINDOW
-                _orig(self_inner, *args, **kwargs)
-            subprocess.Popen.__init__ = _no_window_popen
-            try:
-                self._worker_process.start()
-            finally:
-                subprocess.Popen.__init__ = _orig  # always restore
-        else:
-            self._worker_process.start()
-
-        # Wait for the worker to finish loading the model
-        status, payload = self._result_queue.get()
-        if status == "ready":
-            # Now fetch voice list from the MAIN process (no model needed)
-            os.environ.setdefault("HF_HOME", str(BASE_DIR / "hf_cache"))
-            os.environ["HF_HUB_OFFLINE"] = "1"
-            os.environ["TRANSFORMERS_OFFLINE"] = "1"
-            from vieneu import Vieneu
-            tmp_model = Vieneu(backend="onnx")
-            voices = tmp_model.list_preset_voices()
+            with open(voices_script, "r", encoding="utf-8") as f:
+                content = f.read()
+            voices = ast.literal_eval(content)
             self._voiceLabels = [v[0] for v in voices]
-            self._voiceVids   = [v[1] for v in voices]
+            self._voiceVids = [v[1] for v in voices]
             self.voiceLabelsChanged.emit()
             self.voiceVidsChanged.emit()
-            del tmp_model
-
+            
             self._isModelLoaded = True
             self.isModelLoadedChanged.emit()
             self.set_statusText("Ready.")
-        else:
-            self.set_statusText(f"Model Error: {payload}")
-            return
-
-        # Start the watcher thread that relays results from the queue to Qt signals
-        self._watcher = ResultWatcher(self._result_queue)
-        self._watcher.finished.connect(self.on_generation_finished)
-        self._watcher.start()
-
-    def shutdown(self):
-        """Cleanly shut down the worker process and watcher thread."""
-        if self._watcher:
-            self._watcher.stop()
-        if self._worker_process and self._worker_process.is_alive():
-            self._request_queue.put(None)  # poison pill
-            self._worker_process.join(timeout=3)
+        except Exception as e:
+            self.set_statusText(f"Model Error: {str(e)}")
 
     @pyqtProperty(str, notify=statusChanged)
     def statusText(self):
@@ -169,56 +143,79 @@ class Backend(QObject):
 
     @pyqtSlot(str, str, str, str, str)
     def generate_audio(self, text, output_dir, filename, voice, style):
+        if self._isGenerating:
+            self.set_statusText("Error: Audio generation is already in progress.")
+            return
+            
         if not text.strip():
             self.set_statusText("Error: Text is empty.")
             return
         if not output_dir.strip():
             self.set_statusText("Error: Please select an output directory.")
             return
-
-        # Map style label to API key
-        style_map = {
-            "tự nhiên": "tu_nhien",
-            "kể chuyện": "ke_chuyen",
-            "tin tức": "tin_tuc"
-        }
-        style_key = style_map.get(style, style)
-
+            
         filepath = os.path.join(output_dir, filename)
-
+        
         self._isGenerating = True
         self.isGeneratingChanged.emit()
-        self.set_statusText(f"Generating with {voice} ({style})...")
-
-        # Send job to the persistent worker process
-        self._request_queue.put((text, voice, style_key, filepath))
+        self.set_statusText(f"Đang tạo audio với {voice} ({style})...")
+        
+        # No model reference needed — subprocess loads its own model instance
+        self.worker = TTSWorker(text, filepath, voice, style, parent=self)
+        self.worker.resultReady.connect(self.on_generation_finished)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.worker.start()
 
     @pyqtSlot(bool, str)
     def on_generation_finished(self, success, message):
         self._isGenerating = False
         self.isGeneratingChanged.emit()
         self.set_statusText(message if success else f"Error: {message}")
+        
+        # Clean up the Python reference to the worker. 
+        # The C++ object will be deleted by the 'finished' signal connected to 'deleteLater'.
+        if self.worker:
+            self.worker = None
 
+    @pyqtSlot()
+    def cleanup(self):
+        """Wait for the worker thread to finish when the application closes."""
+        if self.worker and self.worker.isRunning():
+            self.worker.wait()
 
 if __name__ == "__main__":
-    # Required for multiprocessing on Windows (PyInstaller freeze-safe)
-    multiprocessing.freeze_support()
+    # Fix for PyInstaller subprocess (intercept tts_process.py execution)
+    if len(sys.argv) > 1 and sys.argv[1].endswith("tts_process.py"):
+        sys.argv.pop(0)  # Remove the executable from sys.argv
+        import runpy
+        try:
+            runpy.run_path(sys.argv[0], run_name="__main__")
+        except Exception as e:
+            print(str(e), file=sys.stderr)
+        sys.exit(0)
 
     app = QGuiApplication(sys.argv)
     engine = QQmlApplicationEngine()
-
+    
     backend = Backend()
     engine.rootContext().setContextProperty("backend", backend)
-
-    # Start the persistent worker process (loads model once)
-    backend.start_worker()
-
+    
+    # Load model and expose preset voices
+    backend.load_model()
+    
     qml_file = BASE_DIR / "main.qml"
     engine.load(qml_file.as_uri())
-
+    
     if not engine.rootObjects():
         sys.exit(-1)
-
-    exit_code = app.exec()
-    backend.shutdown()
-    sys.exit(exit_code)
+        
+    app.aboutToQuit.connect(backend.cleanup)
+    
+    # Close PyInstaller splash screen if it was built with one
+    try:
+        import pyi_splash
+        pyi_splash.close()
+    except ImportError:
+        pass
+    
+    sys.exit(app.exec())
