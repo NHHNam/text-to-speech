@@ -1,46 +1,45 @@
 """
-tts_process.py — Persistent worker process for TTS inference.
+tts_process.py — Standalone worker script for TTS inference.
 
-This process is spawned ONCE when the app starts. It loads the model once,
-then waits for jobs from the main app via a multiprocessing Queue.
-After each inference, the audio array is explicitly deleted to keep memory stable.
+This script is executed by app.py as a separate subprocess for each generation request.
+When the subprocess exits, the OS reclaims ALL memory including
+ONNX Runtime internal pools — the only reliable way to prevent leaks.
 """
-import os
 import sys
+import os
 from pathlib import Path
 
-def worker_main(request_queue, result_queue, base_dir: str):
-    """
-    Runs in the worker process.
-    Loads the model once, then loops waiting for generation jobs.
-    """
-    base = Path(base_dir)
-    os.environ.setdefault("HF_HOME", str(base / "hf_cache"))
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-
+if __name__ == "__main__":
+    if len(sys.argv) != 5:
+        print(f"Invalid arguments. Expected 5, got {len(sys.argv)}", file=sys.stderr)
+        sys.exit(1)
+        
+    text_file = sys.argv[1]
+    voice = sys.argv[2]
+    style = sys.argv[3]
+    filepath = sys.argv[4]
+    
     try:
+        with open(text_file, "r", encoding="utf-8") as f:
+            text = f.read()
+
+        if getattr(sys, 'frozen', False):
+            base_dir = Path(sys._MEIPASS)
+        else:
+            base_dir = Path(__file__).resolve().parent
+            
+        os.environ["HF_HOME"] = str(base_dir / "hf_cache")
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        
         from vieneu import Vieneu
         model = Vieneu(backend="onnx")
-        result_queue.put(("ready", None))
+        
+        audio = model.infer(text, voice=voice, style=style)
+        model.save(audio, filepath)
+        
+        # Must print exactly "OK" to stdout for app.py to detect success
+        print("OK")
     except Exception as e:
-        result_queue.put(("error", str(e)))
-        return
-
-    # Main job loop — stays alive for the duration of the app
-    while True:
-        job = request_queue.get()
-
-        # Poison pill — shut down cleanly
-        if job is None:
-            break
-
-        text, voice, style, filepath = job
-        try:
-            audio = model.infer(text, voice=voice, style=style)
-            model.save(audio, filepath)
-            # Explicitly free the large audio array immediately after saving
-            del audio
-            result_queue.put(("ok", filepath))
-        except Exception as e:
-            result_queue.put(("error", str(e)))
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
